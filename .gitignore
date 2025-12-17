@@ -1,0 +1,20 @@
+# System
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+
+# Training Data
+ascent_data/conversations.json
+
+# Model Weights & Training Artifacts
+*.pth
+*.pt
+training_logs/
+train.log
+lr_finder.png
+progress_reports/
