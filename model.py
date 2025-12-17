@@ -4,9 +4,12 @@ import datetime
 import json
 import math
 import os
+# Allow MPS to use swap memory to prevent premature OOM
+os.environ["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] = "0.0"
 import random
 import re
 import time
+import gc
 from datetime import timedelta
 
 
@@ -20,15 +23,28 @@ import torch.nn as nn
 from torch.nn.utils.rnn import pad_sequence
 from torch.optim.lr_scheduler import LambdaLR
 
+# Check for Apple Metal (MPS) availability
+if torch.backends.mps.is_available():
+    device = torch.device("mps")
+    print("🚀 Using device: mps")
+    print("   (Metal Performance Shaders enabled for M2 acceleration)")
+elif torch.cuda.is_available():
+    device = torch.device("cuda")
+    print("🚀 Using device: cuda")
+else:
+    device = torch.device("cpu")
+    print("⚠️ Using device: cpu (Slow!)")
+
 # ----------------------------
 # Main Configuration Section
 # ----------------------------
 # Set model and training hyperparameters
 embedding_dim = 384          # Size of each token's embedding vector
 hidden_dim = 512             # Hidden size for the feed-forward layers
-num_transformer_blocks = 4   # Number of transformer layers
-batch_size = 8              # Batch size for training
-learning_rate = 0.0012       # Initial learning rate
+num_transformer_blocks = 8   # Number of transformer layers (Unified Protocol)
+batch_size = 1               # Batch size = 1 for 8GB RAM
+gradient_accumulation_steps = 32 # Accumulate gradients to simulate batch size 32
+learning_rate = 3e-4         # Standard GPT learning rate
 temperature = 0.7            # Sampling temperature for generation
 max_generation_tokens = 50   # Maximum number of tokens generated in chat
 early_stopping_patience = 30    # Early stopping patience
@@ -51,8 +67,18 @@ with open("ascent_data/curated_conversations.json", "r") as f:
     curated_convos = json.load(f)
 
 # Weight curated examples more heavily to anchor tone
+# Weight curated examples more heavily to anchor tone
 curated_weight = 5
 conversations.extend(curated_convos * curated_weight)
+
+# Load Alpaca Data (Instruction Tuning)
+try:
+    with open("ascent_data/alpaca_data.json", "r") as f:
+        print("🦙 Loading Alpaca dataset...")
+        alpaca_convos = json.load(f)
+        conversations.extend(alpaca_convos)
+except FileNotFoundError:
+    print("⚠️ Alpaca data not found. Skipping.")
 
 with open("ascent_data/vocab.json", "r") as f:
     vocab = json.load(f)
@@ -209,7 +235,7 @@ if __name__ == "__main__":
 
     # Print model output size for reference
     print(f"Vocab size / Output size: {vocab_size}")
-    model = Ascent(vocab_size, embedding_dim=embedding_dim, hidden_dim=hidden_dim)
+    model = Ascent(vocab_size, embedding_dim=embedding_dim, hidden_dim=hidden_dim).to(device)
 
     # Try to load an existing model checkpoint if available
     if os.path.exists("Ascent_model.pth"):
@@ -293,12 +319,15 @@ if __name__ == "__main__":
             # Define the loss function and optimizer
             loss_fn = nn.CrossEntropyLoss(label_smoothing=0.02)
             optim = torch.optim.AdamW(model.parameters(), lr=learning_rate)
-            def warmup_cosine_lr(step, warmup_steps=100):
+            # Solace Sugestion #2: Increase warmup steps for stability on small batch sizes
+            def warmup_cosine_lr(step, warmup_steps=500):
                 if step < warmup_steps:
                     return step / warmup_steps
                 return 0.5 * (1 + math.cos((step - warmup_steps) / (500 - warmup_steps) * math.pi))
             scheduler = LambdaLR(optim, lr_lambda=warmup_cosine_lr)
-            total_tokens = sum(len(out) for _, out in data)
+            
+            # Solace Suggestion #1: Restrict sequence length to 256 for 8GB RAM optimization
+            MAX_SEQ_LEN = 256
 
             # Helper function: pad a batch of sequences to the same length
             PAD_VALUE = special_tokens.get("<pad>", 0) if "pad" in special_tokens or "<pad>" in special_tokens else 0
@@ -313,7 +342,6 @@ if __name__ == "__main__":
             min_delta = early_stopping_min_delta
             best_model_state = None
             best_epoch = -1
-            import random
 
             # Resume training support
             resume_state_path = os.path.join(log_dir, "training_state.json")
@@ -332,41 +360,86 @@ if __name__ == "__main__":
                 best_epoch = -1
                 patience_counter = 0
 
+            # -----------------------------------------------------------------
+            # Memory Optimization: Pre-process dataset ONCE to save RAM
+            # -----------------------------------------------------------------
+            print("⚙️  Pre-processing dataset for Causal LM (Concatenation)...")
+            training_data = []
+            for inp, out in data:
+                # Concatenate: [Input] + [Output]
+                full_seq = torch.cat((inp, out))
+                
+                # Truncate to MAX_SEQ_LEN
+                if len(full_seq) > MAX_SEQ_LEN:
+                    # Keep the end of the conversation (most relevant)
+                    full_seq = full_seq[-MAX_SEQ_LEN:]
+                
+                # Prepare Inputs (0..N-1) and Targets (1..N)
+                if len(full_seq) > 1:
+                    training_data.append(full_seq)
+            
+            # Free up the original list of tuples to reclaim standard RAM
+            del data
+            gc.collect()
+            print(f"✅ Dataset prepared. Size: {len(training_data)} sequences.")
+
             # Main training loop over epochs
             try:
                 for epoch in range(start_epoch, total_epochs):
                     epoch_start = time.perf_counter()
-                    random.shuffle(data)
+                    
+                    # Shuffle the pre-processed data
+                    random.shuffle(training_data)
+                    active_data = training_data
 
                     # Show total token count for this epoch
-                    epoch_token_count = sum(len(out) for _, out in data)
+                    epoch_token_count = sum(len(seq) for seq in active_data)
                     print(f"🧮 Tokens this epoch: {epoch_token_count}")
 
                     epoch_losses = []
-                    total_batches = len(data) // batch_size + 1
                     batch_start_time = time.time()
-                    for i in range(0, len(data), batch_size):
-                        batch = data[i:i+batch_size]
-                        inputs = [inp for inp, _ in batch]
-                        targets = [out for _, out in batch]
-                        inp_batch = pad_batch(inputs)
-                        out_batch = pad_batch(targets)
-                        optim.zero_grad()
+                    optim.zero_grad() # Initialize gradients
+                    
+                    for i in range(0, len(active_data), batch_size):
+                        batch_seqs = active_data[i:i+batch_size]
+                        
+                        # Pad the full sequences
+                        padded_batch = pad_batch(batch_seqs).to(device)
+                        
+                        # Create View: Input is sequence excluding last token, Target is sequence excluding first token
+                        inp_batch = padded_batch[:, :-1]
+                        target_batch = padded_batch[:, 1:]
+                        
+                        # Forward Pass
                         logits = model(inp_batch)
-                        seq_len = min(logits.size(1), out_batch.size(1))
-                        logits = logits[:, :seq_len, :]
-                        target = out_batch[:, :seq_len]
+                        
+                        # Calculate Loss
+                        # Flatten: [Batch * SeqLen, Vocab] vs [Batch * SeqLen]
                         logits_flat = logits.reshape(-1, vocab_size)
-                        target_flat = target.reshape(-1)
+                        target_flat = target_batch.reshape(-1)
+                        
                         loss = loss_fn(logits_flat, target_flat)
+                        
+                        # Normalize loss for gradient accumulation
+                        loss = loss / gradient_accumulation_steps
                         loss.backward()
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                        optim.step()
-                        epoch_losses.append(loss.item())
+
+                        if (i // batch_size + 1) % gradient_accumulation_steps == 0 or (i + batch_size >= len(active_data)):
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                            optim.step()
+                            optim.zero_grad() # Only zero grad after step
+                            
+                            # Aggressive memory cleanup for 8GB Mac
+                            if device.type == 'mps':
+                                torch.cuda.empty_cache() if torch.cuda.is_available() else None
+                                torch.mps.empty_cache()
+
+                        # For logging, we want the "real" loss scale back
+                        epoch_losses.append(loss.item() * gradient_accumulation_steps)
 
                         # Batch-level progress bar with ETA
                         batch_elapsed = time.time() - batch_start_time
-                        percent_done = min((i + batch_size) / len(data), 1.0)
+                        percent_done = min((i + batch_size) / len(active_data), 1.0)
                         total_elapsed = time.time() - start_time
                         estimated_total = total_elapsed / percent_done if percent_done > 0 else 0
                         remaining_time = estimated_total - total_elapsed
@@ -375,7 +448,9 @@ if __name__ == "__main__":
                         bar_length = 24
                         filled_length = int(bar_length * percent_done)
                         bar = "█" * filled_length + "-" * (bar_length - filled_length)
-                        print(f"\r[{bar}] Progress: {int(percent_done * 100)}% | ETA: {eta} | Batch Loss: {loss.item():.4f}", end="", flush=True)
+                        # Correctly display the REAL loss (unscaled)
+                        real_loss = loss.item() * gradient_accumulation_steps
+                        print(f"\r[{bar}] Progress: {int(percent_done * 100)}% | ETA: {eta} | Batch Loss: {real_loss:.4f}", end="", flush=True)
 
                     avg_loss = sum(epoch_losses) / len(epoch_losses)
                     losses.append(avg_loss)
@@ -388,23 +463,10 @@ if __name__ == "__main__":
                         f_ppl.write(f"{perplexity}\n")
 
                     # Print dynamic single-line progress summary (keep for batch progress)
-                    print(f"\rEpoch {epoch + 1}/{total_epochs} | Loss: {avg_loss:.4f} | Perplexity: {perplexity:.2f} | Patience: {patience_counter}/{patience}", end="", flush=True)
-
                     epoch_duration = time.perf_counter() - epoch_start
+                    print(f"\rEpoch {epoch + 1}/{total_epochs} | Loss: {avg_loss:.4f} | Perplexity: {perplexity:.2f} | Duration: {epoch_duration:.2f}s{' ' * 20}", end="", flush=True)
 
-                    # Print loss/perplexity and total training ETA every 10 epochs or last epoch
-                    if (epoch + 1) % 10 == 0 or epoch == total_epochs - 1:
-                        print(f"\rEpoch {epoch + 1}/{total_epochs} | Loss: {avg_loss:.4f} | Perplexity: {perplexity:.2f} | Duration: {epoch_duration:.2f}s")
-                        # Estimate total training duration
-                        total_elapsed_time = time.time() - total_training_start_time
-                        percent_complete = (epoch + 1) / total_epochs
-                        estimated_total_time = total_elapsed_time / percent_complete
-                        eta_total = timedelta(seconds=int(estimated_total_time - total_elapsed_time))
-                        print(f"🕒 Elapsed: {timedelta(seconds=int(total_elapsed_time))} | ETA to complete: {eta_total}")
-                    else:
-                        # Overwrite line to keep display clean
-                        print(f"\rEpoch {epoch + 1}/{total_epochs} | Loss: {avg_loss:.4f} | Perplexity: {perplexity:.2f} | Duration: {epoch_duration:.2f}s{' ' * 20}", end="", flush=True)
-
+                    # Update learning rate (Solace suggestion)
                     scheduler.step()
 
                     # Save training state

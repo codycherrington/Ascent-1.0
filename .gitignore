@@ -10,6 +10,8 @@ env/
 
 # Training Data
 ascent_data/conversations.json
+ascent_data/alpaca_data.json
+ascent_data/*.pkl
 
 # Model Weights & Training Artifacts
 *.pth

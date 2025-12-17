@@ -30,6 +30,13 @@ try:
 except FileNotFoundError:
     print("⚠️ identity.json not found. Skipping.")
 
+try:
+    with open(os.path.join(OUTPUT_DIR, "alpaca_data.json"), "r") as f:
+        print("🦙 Loading Alpaca dataset...")
+        conversations.extend(json.load(f))
+except FileNotFoundError:
+    print("⚠️ alpaca_data.json not found. Skipping.")
+
 if not conversations:
     print("❌ No valid conversation files found.")
     sys.exit(1)
@@ -43,7 +50,7 @@ def signature(convo):
 
 duplicate_signatures = set()
 
-for filename in ["curated_conversations.json", "identity.json"]:
+for filename in ["curated_conversations.json", "identity.json", "alpaca_data.json"]:
     try:
         with open(os.path.join(OUTPUT_DIR, filename), "r") as f:
             for entry in json.load(f):
@@ -135,5 +142,5 @@ with open(os.path.join(OUTPUT_DIR, "conversations.json"), "w") as f:
     json.dump(formatted_convos, f, indent=2)
 
 print(f"✅ Export complete. Vocab size: {len(vocab)} tokens.")
-print(f"📝 Tokenizer processed input from: conversations.json, curated_conversations.json, identity.json")
+print(f"📝 Tokenizer processed input from: conversations.json, curated_conversations.json, identity.json, alpaca_data.json")
 print(f"📦 Saved to '{OUTPUT_DIR}': conversations.json (cleaned), vocab.json, id_to_word.json, special_tokens.json")
